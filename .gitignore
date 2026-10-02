@@ -1,0 +1,31 @@
+# Build trees
+build/
+out/
+install/
+cmake-build-*/
+
+# Editor / IDE
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# Platform debris
+*.obj
+*.o
+*.pdb
+*.ilk
+*.exe
+*.dll
+*.lib
+*.so
+*.dylib
+*.a
+
+# Runtime and test scratch
+*.gpf-store/
+*.log.tmp
+core
+core.*
+*.dmp

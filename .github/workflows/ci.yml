@@ -1,0 +1,128 @@
+# Continuous integration for Global Policy Federation.
+#
+# Standard hosted runners only. Tests are run plainly: no CTest TIMEOUT property, no shell timeout
+# wrapper, no watchdogs, no timeout-minutes. A hanging test is a defect to diagnose, not a
+# condition to mask.
+#
+# Sanitizers: Linux exercises AddressSanitizer and UndefinedBehaviorSanitizer with GCC and Clang.
+# MSVC's address sanitizer is exercised only where the toolset genuinely supports it, so Windows
+# sanitizer coverage is documented as a limitation rather than claimed.
+
+name: ci
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-msvc:
+    name: Windows / MSVC (${{ matrix.config }})
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [Debug, Release]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: >
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          -DGPF_BUILD_TESTS=ON -DGPF_BUILD_APPS=ON -DGPF_BUILD_EXAMPLES=ON
+          -DGPF_BUILD_BENCHMARKS=${{ matrix.config == 'Release' && 'ON' || 'OFF' }}
+      - name: Build
+        run: cmake --build build --config ${{ matrix.config }} --parallel
+      - name: Test
+        run: ctest --test-dir build -C ${{ matrix.config }} --output-on-failure
+      - name: Benchmarks (Release)
+        if: matrix.config == 'Release'
+        run: build/benchmarks/Release/gpf_benchmarks.exe --scale=1
+
+  ubuntu-gcc:
+    name: Ubuntu / GCC (${{ matrix.config }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [Debug, Release]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.config }}
+          -DGPF_BUILD_TESTS=ON -DGPF_BUILD_APPS=ON -DGPF_BUILD_EXAMPLES=ON
+          -DGPF_BUILD_BENCHMARKS=${{ matrix.config == 'Release' && 'ON' || 'OFF' }}
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      - name: Benchmarks (Release)
+        if: matrix.config == 'Release'
+        run: ./build/benchmarks/gpf_benchmarks --scale=1
+
+  ubuntu-clang:
+    name: Ubuntu / Clang (${{ matrix.config }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [Debug, Release]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.config }}
+          -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+          -DGPF_BUILD_TESTS=ON -DGPF_BUILD_APPS=ON -DGPF_BUILD_EXAMPLES=ON
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  sanitizers:
+    name: Sanitizers (${{ matrix.sanitizer }} / ${{ matrix.compiler }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+        sanitizer: [address+undefined]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_C_COMPILER=${{ matrix.compiler == 'gcc' && 'gcc' || 'clang' }}
+          -DCMAKE_CXX_COMPILER=${{ matrix.compiler == 'gcc' && 'g++' || 'clang++' }}
+          -DCMAKE_CXX_FLAGS="-fsanitize=${{ matrix.sanitizer }} -fno-omit-frame-pointer -g"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=${{ matrix.sanitizer }}"
+          -DGPF_BUILD_TESTS=ON -DGPF_BUILD_APPS=ON -DGPF_BUILD_EXAMPLES=ON
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Test
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: ctest --test-dir build --output-on-failure
+
+  package-consumption:
+    name: Package consumption (Linux, GCC)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and install
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGPF_BUILD_TESTS=ON \
+            -DGPF_BUILD_APPS=ON -DGPF_BUILD_EXAMPLES=OFF
+          cmake --build build --parallel
+          cmake --install build --prefix "$PWD/prefix"
+      - name: Build an independent consumer against the installed package
+        run: |
+          cmake -S examples/downstream-consumer -B consumer-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$PWD/prefix"
+          cmake --build consumer-build --parallel
+          ./consumer-build/gpf-downstream-consumer

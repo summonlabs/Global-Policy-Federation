@@ -1,0 +1,12 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+# Global Policy Federation ships a portable first-party core. Threads is the only transitive
+# dependency; on Windows the socket adapter is satisfied by the platform ws2_32 library that
+# the exported target links directly.
+find_dependency(Threads)
+
+include("${CMAKE_CURRENT_LIST_DIR}/GlobalPolicyFederationTargets.cmake")
+
+check_required_components(GlobalPolicyFederation)
