@@ -11,9 +11,11 @@
 #include "gpf/platform.hpp"
 #include "test_support.hpp"
 
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace gpf;
@@ -61,6 +63,64 @@ Result<JsonValue> summary_of(const std::filesystem::path& path, const std::strin
 // accept, so when the site reports that it could not connect the coordinator is stopped and the
 // failure is reported instead of hanging the run. This is driven by the child's exit code, not by
 // a clock: the flow is deterministic.
+// Waits for a freshly started coordinator to announce that it is listening on the port this run
+// expects. The wait is driven by the child's own behaviour: it ends when the announcement appears
+// in the child's standard output, and it fails the moment the child exits. Nothing here bounds the
+// wait with a clock, so a coordinator that never listens is reported as a hang to diagnose rather
+// than as a silent pass. The short yield between probes only keeps the loop from spinning hot.
+Result<std::uint16_t> await_listening(platform::ProcessHandle& child,
+                                         const std::filesystem::path& stdout_path) {
+  // The coordinator binds the port and announces it; the test therefore never guesses a port and
+  // never races a fresh listener. The announcement is printed after the listener is established, so
+  // a connection made immediately afterwards is accepted by the backlog.
+  const std::string marker = "\"port\":";
+  for (;;) {
+    auto output = platform::read_file(stdout_path, 65536);
+    if (output.ok() && output->find("\"listening\"") != std::string::npos) {
+      const std::size_t at = output->find(marker);
+      if (at != std::string::npos) {
+        const std::size_t start = at + marker.size();
+        std::size_t end = start;
+        while (end < output->size() && (*output)[end] >= '0' && (*output)[end] <= '9') ++end;
+        if (end > start) {
+          const unsigned long announced = std::strtoul(output->substr(start, end - start).c_str(), nullptr, 10);
+          if (announced != 0 && announced <= 65535) {
+            return Result<std::uint16_t>::success(static_cast<std::uint16_t>(announced));
+          }
+        }
+      }
+    }
+    auto exited = platform::process_has_exited(child);
+    if (!exited.ok()) return Result<std::uint16_t>::failure(exited.error);
+    if (*exited) {
+      auto diagnostics = platform::read_file(stdout_path, 4096);
+      return Result<std::uint16_t>::failure(
+          ErrorCode::NotConnected, "the coordinator exited before it began listening: " +
+                                       (diagnostics.ok() ? diagnostics->substr(0, 256)
+                                                         : std::string("(no output)")));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+}
+
+// Runs a program to completion without a shell in the path, capturing both streams. A child that
+// fails reports its own diagnostics, so a failure is never a bare exit code.
+Result<int> run_captured(const std::string& program, const std::vector<std::string>& arguments,
+                         const std::filesystem::path& stdout_path,
+                         const std::filesystem::path& stderr_path, const char* phase) {
+  auto child = platform::spawn_process(program, arguments, stdout_path, stderr_path);
+  if (!child.ok()) return Result<int>::failure(child.error);
+  auto code = platform::wait_process(*child.value);
+  if (!code.ok()) return code;
+  if (*code != 0) {
+    auto diagnostics = platform::read_file(stderr_path, 2048);
+    std::string detail = std::string(phase) + " exited with " + std::to_string(*code);
+    if (diagnostics.ok() && !diagnostics->empty()) detail += ": " + diagnostics->substr(0, 512);
+    (void)platform::write_file_atomic(stderr_path, detail);
+  }
+  return code;
+}
+
 Result<int> finish_coordinator(platform::ProcessHandle& coordinator, int site_exit_code,
                                const char* phase) {
   if (site_exit_code == 2) {
@@ -69,14 +129,6 @@ Result<int> finish_coordinator(platform::ProcessHandle& coordinator, int site_ex
                                 std::string(phase) + ": the site could not reach the coordinator");
   }
   return platform::wait_process(coordinator);
-}
-
-std::uint16_t reserve_port() {
-  auto listener = net::Socket::listen("127.0.0.1", 0);
-  if (!listener.ok()) return 0;
-  const std::uint16_t port = listener->local_port();
-  listener->close();
-  return port;
 }
 
 std::string generation_field(const JsonValue& value, const char* key) {
@@ -174,6 +226,14 @@ GPF_TEST(multiprocess, coordinator_and_site_negotiate_over_a_real_socket_and_sur
   const std::filesystem::path fed_out = directory.child("federation.out");
   const std::filesystem::path fed_err = directory.child("federation.err");
   const std::filesystem::path fed_summary = directory.child("federation-summary.json");
+  // The restarted coordinator keeps its own evidence files. Readiness is announced on standard
+  // output, so sharing a file across incarnations could let a stale announcement satisfy the wait.
+  const std::filesystem::path fed_out_restart = directory.child("federation-restart.out");
+  const std::filesystem::path fed_err_restart = directory.child("federation-restart.err");
+  const std::filesystem::path fed_summary_restart = directory.child("federation-restart-summary.json");
+  // Site runs capture both streams, so a failing site reports why instead of only an exit code.
+  const std::filesystem::path site_out = directory.child("site.out");
+  const std::filesystem::path site_err = directory.child("site.err");
 
   auto plan = generate_scenario(4242, 2, 1);
   if (!plan.ok()) NOTE("scenario failed: " + plan.error.to_string());
@@ -183,32 +243,34 @@ GPF_TEST(multiprocess, coordinator_and_site_negotiate_over_a_real_socket_and_sur
   REQUIRE(plan_two.ok());
   REQUIRE(save_plan(*plan_two, plan2_path).ok());
 
-  const std::uint16_t port = reserve_port();
-  REQUIRE(port != 0);
-  const std::string endpoint = "127.0.0.1:" + std::to_string(port);
-  // Each coordinator incarnation binds its own port, so a restart never races a socket in
-  // TIME_WAIT from the previous incarnation.
-  const std::uint16_t reconnect_port = reserve_port();
-  REQUIRE(reconnect_port != 0);
-  const std::string reconnect_endpoint = "127.0.0.1:" + std::to_string(reconnect_port);
-  const std::uint16_t final_port = reserve_port();
-  REQUIRE(final_port != 0);
-  const std::string final_endpoint = "127.0.0.1:" + std::to_string(final_port);
+  // Ports are never guessed or reserved by the test. Every coordinator asks the operating system
+  // for a free port, announces the port it actually bound, and only then does a site connect. That
+  // removes both the reservation window and the start-up race.
+  std::string endpoint;
+  std::string reconnect_endpoint;
+
   const std::string capabilities = "power.metering=2.1.0,cooling.liquid=1.4.0";
 
   // ---- Phase 1: real socket session, acceptance, activation, receipts ---------------------
   auto coordinator = platform::spawn_process(
       binaries.federation,
       {"serve", "--plan", plan_path.string(), "--store", coordinator_store.string(), "--port",
-       std::to_string(port), "--sessions", "2", "--out", fed_summary.string()},
+       "0", "--sessions", "2", "--out", fed_summary.string()},
       fed_out, fed_err);
   if (!coordinator.ok()) NOTE("spawn failed: " + coordinator.error.to_string());
   REQUIRE(coordinator.ok());
+  const auto listening = await_listening(*coordinator.value, fed_out);
+  if (!listening.ok()) NOTE("phase 1: " + listening.error.message);
+  REQUIRE(listening.ok());
+  const std::uint16_t port = *listening;
+  endpoint = "127.0.0.1:" + std::to_string(port);
 
-  auto first_sync = platform::run_process(
-      binaries.site, {"run", "--plan", plan_path.string(), "--site-index", "0", "--store",
-                      site_store.string(), "--connect", endpoint, "--sync-count", "1",
-                      "--capabilities", capabilities, "--out", site_summary.string()});
+  auto first_sync = run_captured(
+      binaries.site,
+      {"run", "--plan", plan_path.string(), "--site-index", "0", "--store", site_store.string(),
+       "--connect", endpoint, "--sync-count", "1", "--capabilities", capabilities, "--out",
+       site_summary.string()},
+      site_out, site_err, "phase 1 site run");
   REQUIRE(first_sync.ok());
   CHECK_EQ(*first_sync, 0);
 
@@ -225,11 +287,12 @@ GPF_TEST(multiprocess, coordinator_and_site_negotiate_over_a_real_socket_and_sur
   CHECK_EQ(generation_field(*effective, "conflicts"), std::string("0"));
 
   // ---- Phase 1b: a local override that the delegated authority permits --------------------
-  auto override_run = platform::run_process(
-      binaries.site, {"run", "--plan", plan_path.string(), "--site-index", "0", "--store",
-                      site_store.string(), "--connect", endpoint, "--sync-count", "1",
-                      "--override", "power/max_kw=95", "--override-reason",
-                      "site thermal envelope", "--out", override_summary.string()});
+  auto override_run = run_captured(
+      binaries.site,
+      {"run", "--plan", plan_path.string(), "--site-index", "0", "--store", site_store.string(),
+       "--connect", endpoint, "--sync-count", "1", "--override", "power/max_kw=95",
+       "--override-reason", "site thermal envelope", "--out", override_summary.string()},
+      site_out, site_err, "phase 1b site run");
   REQUIRE(override_run.ok());
   CHECK_EQ(*override_run, 0);
   auto override_json = summary_of(override_summary, "gpf-site override");
@@ -275,10 +338,11 @@ GPF_TEST(multiprocess, coordinator_and_site_negotiate_over_a_real_socket_and_sur
   const std::int64_t collected_after_phase_one = collected->as_int();
 
   // ---- Phase 2: partition. The coordinator is not running at all. -------------------------
-  auto partitioned = platform::run_process(
-      binaries.site, {"run", "--plan", plan_path.string(), "--site-index", "0", "--store",
-                      site_store.string(), "--connect", endpoint, "--sync-count", "1", "--out",
-                      partition_summary.string()});
+  auto partitioned = run_captured(
+      binaries.site,
+      {"run", "--plan", plan_path.string(), "--site-index", "0", "--store", site_store.string(),
+       "--connect", endpoint, "--sync-count", "1", "--out", partition_summary.string()},
+      site_out, site_err, "phase 2 partition run");
   REQUIRE(partitioned.ok());
   CHECK_EQ(*partitioned, 2);  // distinct exit code: synced nowhere, still operational
   auto partition_json = summary_of(partition_summary, "gpf-site partition");
@@ -310,18 +374,26 @@ GPF_TEST(multiprocess, coordinator_and_site_negotiate_over_a_real_socket_and_sur
   CHECK(saw_withheld);          // require-fresh policy is withheld, not silently kept
 
   // ---- Phase 3: reconnect against a restarted coordinator that publishes more policy -------
+  // This coordinator serves two sessions: the reconnecting site here, and the override attempt in
+  // phase 4. Reusing a listener that is already serving removes any dependence on a client winning
+  // a race against a freshly started listener, which is a race the test must not have.
   auto restarted = platform::spawn_process(
       binaries.federation,
       {"serve", "--plan", plan2_path.string(), "--store", coordinator_store.string(), "--port",
-       std::to_string(reconnect_port), "--sessions", "1", "--out", fed_summary.string()},
-      fed_out, fed_err);
+       "0", "--sessions", "2", "--out", fed_summary_restart.string()},
+      fed_out_restart, fed_err_restart);
   if (!restarted.ok()) NOTE("respawn failed: " + restarted.error.to_string());
   REQUIRE(restarted.ok());
+  const auto restarted_listening = await_listening(*restarted.value, fed_out_restart);
+  if (!restarted_listening.ok()) NOTE("phase 3: " + restarted_listening.error.message);
+  REQUIRE(restarted_listening.ok());
+  reconnect_endpoint = "127.0.0.1:" + std::to_string(*restarted_listening);
 
-  auto reconnect = platform::run_process(
-      binaries.site, {"run", "--plan", plan2_path.string(), "--site-index", "0", "--store",
-                      site_store.string(), "--connect", reconnect_endpoint, "--sync-count", "1",
-                      "--out", reconnect_summary.string()});
+  auto reconnect = run_captured(
+      binaries.site,
+      {"run", "--plan", plan2_path.string(), "--site-index", "0", "--store", site_store.string(),
+       "--connect", reconnect_endpoint, "--sync-count", "1", "--out", reconnect_summary.string()},
+      site_out, site_err, "phase 3 reconnect run");
   REQUIRE(reconnect.ok());
   CHECK_EQ(*reconnect, 0);
   auto reconnect_json = summary_of(reconnect_summary, "gpf-site reconnect");
@@ -355,11 +427,24 @@ GPF_TEST(multiprocess, coordinator_and_site_negotiate_over_a_real_socket_and_sur
     }
   }
 
-  auto restarted_exit = finish_coordinator(*restarted.value, *reconnect, "phase 3");
-  if (!restarted_exit.ok()) NOTE("phase 3: " + restarted_exit.error.message);
+  // ---- Phase 4: the newest mandatory policy forbids override: deterministic refusal ---------
+  // The server is already listening from phase 3, so this session is served without any start-up
+  // race; the override attempt runs against the newest accepted policy.
+  auto refused = run_captured(
+      binaries.site,
+      {"run", "--plan", plan2_path.string(), "--site-index", "0", "--store", site_store.string(),
+       "--connect", reconnect_endpoint, "--sync-count", "1", "--override", "power/max_kw=95",
+       "--override-reason", "attempted under prohibited policy", "--out", refused_summary.string()},
+      site_out, site_err, "phase 4 site run");
+  REQUIRE(refused.ok());
+  CHECK_EQ(*refused, 0);
+
+  // Both sessions have now been served, so the coordinator completes and publishes its summary.
+  auto restarted_exit = finish_coordinator(*restarted.value, *refused, "phase 4");
+  if (!restarted_exit.ok()) NOTE("phase 4: " + restarted_exit.error.message);
   REQUIRE(restarted_exit.ok());
   if (*restarted_exit != 0) {
-    auto diagnostics = platform::read_file(fed_err, 4096);
+    auto diagnostics = platform::read_file(fed_err_restart, 4096);
     NOTE("restarted coordinator reported: " +
          (diagnostics.ok() ? *diagnostics : std::string("(no diagnostics)")));
     auto site_diagnostics = platform::read_file(reconnect_summary, 4096);
@@ -367,7 +452,7 @@ GPF_TEST(multiprocess, coordinator_and_site_negotiate_over_a_real_socket_and_sur
          (site_diagnostics.ok() ? site_diagnostics->substr(0, 400) : std::string("(none)")));
   }
   CHECK_EQ(*restarted_exit, 0);
-  auto second_summary = summary_of(fed_summary, "gpf-federation restart");
+  auto second_summary = summary_of(fed_summary_restart, "gpf-federation restart");
   REQUIRE(second_summary.ok());
   const JsonValue* second_collected = second_summary->find("collected_receipts");
   REQUIRE(second_collected != nullptr);
@@ -377,26 +462,6 @@ GPF_TEST(multiprocess, coordinator_and_site_negotiate_over_a_real_socket_and_sur
   const JsonValue* rejected_receipts = second_summary->find("rejected_receipts");
   REQUIRE(rejected_receipts != nullptr);
   CHECK_EQ(rejected_receipts->as_int(), std::int64_t{0});
-
-  // ---- Phase 4: the newest mandatory policy forbids override: deterministic refusal ---------
-  auto final_coordinator = platform::spawn_process(
-      binaries.federation,
-      {"serve", "--plan", plan2_path.string(), "--store", coordinator_store.string(), "--port",
-       std::to_string(final_port), "--sessions", "1", "--out", fed_summary.string()},
-      fed_out, fed_err);
-  if (!final_coordinator.ok()) NOTE("final spawn failed: " + final_coordinator.error.to_string());
-  REQUIRE(final_coordinator.ok());
-  auto refused = platform::run_process(
-      binaries.site, {"run", "--plan", plan2_path.string(), "--site-index", "0", "--store",
-                      site_store.string(), "--connect", final_endpoint, "--sync-count", "1",
-                      "--override", "power/max_kw=95", "--override-reason",
-                      "attempted under prohibited policy", "--out", refused_summary.string()});
-  REQUIRE(refused.ok());
-  CHECK_EQ(*refused, 0);
-  auto final_exit = finish_coordinator(*final_coordinator.value, *refused, "phase 4");
-  if (!final_exit.ok()) NOTE("phase 4: " + final_exit.error.message);
-  REQUIRE(final_exit.ok());
-  CHECK_EQ(*final_exit, 0);
 
   auto refused_json = summary_of(refused_summary, "gpf-site refused override");
   if (!refused_json.ok()) NOTE(refused_json.error.message);

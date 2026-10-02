@@ -1,19 +1,19 @@
-#include "gpf/net.hpp"
+﻿#include "gpf/net.hpp"
 
 #include <algorithm>
-#include <atomic>
 #include <cstring>
-#include <mutex>
 
 #if defined(_WIN32)
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #else
 #include <arpa/inet.h>
+#include <cerrno>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <unistd.h>
 #endif
 
@@ -23,21 +23,28 @@ namespace {
 #if defined(_WIN32)
 using NativeHandle = SOCKET;
 constexpr NativeHandle kInvalid = INVALID_SOCKET;
+// Winsock takes an int address length; POSIX takes socklen_t, which is unsigned on Linux. Naming
+// the platform's type once keeps every call site free of signedness conversions.
+using AddressLength = int;
 #else
 using NativeHandle = int;
 constexpr NativeHandle kInvalid = -1;
+using AddressLength = socklen_t;
 #endif
 
-std::once_flag g_init_once;
-
 void initialize() {
-  std::call_once(g_init_once, [] {
 #if defined(_WIN32)
+  // A function-local static carries the language's once-only initialization guarantee, so socket
+  // start-up needs no runtime-specific once machinery and the library links against any conforming
+  // C++ runtime rather than one implementation's internals.
+  static const bool started = [] {
     WSADATA data;
     const int result = WSAStartup(MAKEWORD(2, 2), &data);
     (void)result;
+    return true;
+  }();
+  (void)started;
 #endif
-  });
 }
 
 Status socket_error(const std::string& message, const std::string& detail = {}) {
@@ -66,6 +73,39 @@ Status set_nodelay(NativeHandle handle) {
     return socket_error("cannot configure the socket");
   }
   return Status::success();
+}
+
+// Writing to a socket whose peer has gone raises SIGPIPE on POSIX, whose default action terminates
+// the process. A failed send must be a returned error, never a dead runtime, so the signal is
+// suppressed at the socket (SO_NOSIGPIPE) and at the send call (MSG_NOSIGNAL) wherever the platform
+// offers it. Where neither exists, callers should ignore SIGPIPE; that is documented in net.hpp.
+Status set_no_sigpipe(NativeHandle handle) {
+#if defined(SO_NOSIGPIPE)
+  const int enabled = 1;
+  const char* bytes = reinterpret_cast<const char*>(&enabled);
+  if (::setsockopt(handle, SOL_SOCKET, SO_NOSIGPIPE, bytes, sizeof(enabled)) != 0) {
+    return socket_error("cannot configure the socket");
+  }
+#else
+  (void)handle;
+#endif
+  return Status::success();
+}
+
+// One send policy for every platform: the flag that suppresses SIGPIPE where the platform has it,
+// and nothing where it does not (Windows raises no such signal).
+#if defined(MSG_NOSIGNAL)
+constexpr int kSendFlags = MSG_NOSIGNAL;
+#else
+constexpr int kSendFlags = 0;
+#endif
+
+// Every socket this boundary hands out is configured the same way: no Nagle batching (policy
+// frames are request/response, never bulk streams) and no SIGPIPE surprise on a vanished peer.
+Status configure_socket(NativeHandle handle) {
+  const Status no_delay = set_nodelay(handle);
+  if (!no_delay.ok()) return no_delay;
+  return set_no_sigpipe(handle);
 }
 
 }  // namespace
@@ -142,7 +182,8 @@ Result<Socket> Socket::listen(const std::string& address, std::uint16_t port, in
     if (handle == kInvalid) continue;
     const int reuse = 1;
     ::setsockopt(handle, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
-    if (::bind(handle, candidate->ai_addr, static_cast<int>(candidate->ai_addrlen)) == 0 &&
+    if (::bind(handle, candidate->ai_addr,
+               static_cast<AddressLength>(candidate->ai_addrlen)) == 0 &&
         ::listen(handle, backlog) == 0) {
       socket.handle_ = static_cast<std::intptr_t>(handle);
       break;
@@ -153,6 +194,7 @@ Result<Socket> Socket::listen(const std::string& address, std::uint16_t port, in
   if (!socket.is_open()) {
     return Result<Socket>::failure(ErrorCode::Unavailable, "cannot bind and listen", address);
   }
+  (void)configure_socket(static_cast<NativeHandle>(socket.handle_));
   return Result<Socket>::success(std::move(socket));
 }
 
@@ -175,9 +217,10 @@ Result<Socket> Socket::connect(const std::string& address, std::uint16_t port) {
   for (addrinfo* candidate = results; candidate != nullptr; candidate = candidate->ai_next) {
     const NativeHandle handle = ::socket(candidate->ai_family, candidate->ai_socktype, candidate->ai_protocol);
     if (handle == kInvalid) continue;
-    if (::connect(handle, candidate->ai_addr, static_cast<int>(candidate->ai_addrlen)) == 0) {
+    if (::connect(handle, candidate->ai_addr,
+                  static_cast<AddressLength>(candidate->ai_addrlen)) == 0) {
       socket.handle_ = static_cast<std::intptr_t>(handle);
-      (void)set_nodelay(handle);
+      (void)configure_socket(handle);
       break;
     }
     close_handle(handle);
@@ -195,7 +238,7 @@ Result<Socket> Socket::accept() {
     return Result<Socket>::failure(ErrorCode::InvalidState, "listener is not open");
   }
   sockaddr_storage storage{};
-  socklen_t length = sizeof(storage);
+  AddressLength length = static_cast<AddressLength>(sizeof(storage));
   const NativeHandle handle =
       ::accept(static_cast<NativeHandle>(handle_), reinterpret_cast<sockaddr*>(&storage), &length);
   if (handle == kInvalid) {
@@ -203,7 +246,7 @@ Result<Socket> Socket::accept() {
   }
   Socket socket;
   socket.handle_ = static_cast<std::intptr_t>(handle);
-  (void)set_nodelay(handle);
+  (void)configure_socket(handle);
   return Result<Socket>::success(std::move(socket));
 }
 
@@ -216,10 +259,10 @@ Status Socket::send_all(std::string_view bytes) {
     const std::size_t remaining = bytes.size() - sent;
     const int chunk = static_cast<int>(std::min<std::size_t>(remaining, 1u << 20));
 #if defined(_WIN32)
-    const int result = ::send(static_cast<NativeHandle>(handle_), bytes.data() + sent, chunk, 0);
+    const int result = ::send(static_cast<NativeHandle>(handle_), bytes.data() + sent, chunk, kSendFlags);
 #else
     const ssize_t result = ::send(static_cast<NativeHandle>(handle_), bytes.data() + sent,
-                                  static_cast<std::size_t>(chunk), 0);
+                                  static_cast<std::size_t>(chunk), kSendFlags);
 #endif
     if (result <= 0) return socket_error("send failed", std::to_string(sent) + " bytes written");
     sent += static_cast<std::size_t>(result);
@@ -297,7 +340,7 @@ Status Socket::send_frame(std::string_view payload) {
 std::uint16_t Socket::local_port() const noexcept {
   if (handle_ == -1) return 0;
   sockaddr_storage storage{};
-  socklen_t length = sizeof(storage);
+  AddressLength length = static_cast<AddressLength>(sizeof(storage));
   if (::getsockname(static_cast<NativeHandle>(handle_), reinterpret_cast<sockaddr*>(&storage), &length) != 0) {
     return 0;
   }
@@ -315,7 +358,7 @@ std::uint16_t Socket::local_port() const noexcept {
 std::uint16_t Socket::peer_port() const noexcept {
   if (handle_ == -1) return 0;
   sockaddr_storage storage{};
-  socklen_t length = sizeof(storage);
+  AddressLength length = static_cast<AddressLength>(sizeof(storage));
   if (::getpeername(static_cast<NativeHandle>(handle_), reinterpret_cast<sockaddr*>(&storage), &length) != 0) {
     return 0;
   }
@@ -329,7 +372,7 @@ std::uint16_t Socket::peer_port() const noexcept {
 std::string Socket::peer_address() const {
   if (handle_ == -1) return {};
   sockaddr_storage storage{};
-  socklen_t length = sizeof(storage);
+  AddressLength length = static_cast<AddressLength>(sizeof(storage));
   if (::getpeername(static_cast<NativeHandle>(handle_), reinterpret_cast<sockaddr*>(&storage), &length) != 0) {
     return {};
   }

@@ -13,6 +13,13 @@ foreach(required GPF_SOURCE_DIR GPF_BUILD_DIR GPF_WORK_DIR)
   endif()
 endforeach()
 
+# Multi-configuration generators (Visual Studio, Xcode) have no single build type, so the
+# configuration validated by CTest is passed in and used for every install and build step.
+set(config_arguments "")
+if(DEFINED GPF_CONFIG AND NOT GPF_CONFIG STREQUAL "")
+  list(APPEND config_arguments --config "${GPF_CONFIG}")
+endif()
+
 set(prefix "${GPF_WORK_DIR}/prefix")
 set(consumer_build "${GPF_WORK_DIR}/consumer-build")
 file(REMOVE_RECURSE "${prefix}" "${consumer_build}")
@@ -21,6 +28,7 @@ file(MAKE_DIRECTORY "${GPF_WORK_DIR}")
 message(STATUS "installing into ${prefix}")
 execute_process(
   COMMAND "${CMAKE_COMMAND}" --install "${GPF_BUILD_DIR}" --prefix "${prefix}"
+          ${config_arguments}
   RESULT_VARIABLE install_result
   OUTPUT_VARIABLE install_output
   ERROR_VARIABLE install_error)
@@ -74,7 +82,8 @@ endif()
 
 message(STATUS "building the downstream consumer")
 execute_process(
-  COMMAND "${CMAKE_COMMAND}" --build "${consumer_build}" --config Release
+  COMMAND "${CMAKE_COMMAND}" --build "${consumer_build}"
+          ${config_arguments}
   RESULT_VARIABLE build_result
   OUTPUT_VARIABLE build_output
   ERROR_VARIABLE build_error)

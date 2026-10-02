@@ -60,6 +60,22 @@ constexpr ErrorNameEntry kErrorNames[] = {
 
 constexpr std::size_t kErrorNameCount = sizeof(kErrorNames) / sizeof(kErrorNames[0]);
 
+// This table is the stable machine-readable error vocabulary, so it is checked at compile time
+// rather than trusted: every entry carries a name, and no code appears twice. A duplicate would
+// make error_code_name ambiguous, and an empty name would silently collapse two distinctions.
+constexpr bool error_names_are_unambiguous() {
+  for (std::size_t i = 0; i < kErrorNameCount; ++i) {
+    if (kErrorNames[i].name == nullptr || kErrorNames[i].name[0] == '\0') return false;
+    for (std::size_t j = i + 1; j < kErrorNameCount; ++j) {
+      if (kErrorNames[i].code == kErrorNames[j].code) return false;
+    }
+  }
+  return true;
+}
+
+static_assert(error_names_are_unambiguous(),
+              "every error code must carry exactly one stable name");
+
 std::int64_t floor_div(std::int64_t numerator, std::int64_t denominator) noexcept {
   std::int64_t quotient = numerator / denominator;
   const std::int64_t remainder = numerator % denominator;

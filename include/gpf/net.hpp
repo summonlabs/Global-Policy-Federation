@@ -4,6 +4,12 @@
 // A blocking, bounded, first-party socket wrapper. There is no receive timeout anywhere in this
 // project: a peer that stops talking keeps its connection until it is closed, and shutdown works
 // by closing the socket rather than by racing a clock.
+//
+// Sockets are configured with TCP_NODELAY, and SIGPIPE is suppressed per socket where the platform
+// offers SO_NOSIGPIPE, with MSG_NOSIGNAL used on every send where it exists. On a platform that
+// offers neither, a peer that disappears mid-write can deliver SIGPIPE to the process; such a
+// platform must ignore SIGPIPE in its own start-up, because this library never changes process-wide
+// signal disposition on a caller's behalf.
 
 #include "gpf/base.hpp"
 

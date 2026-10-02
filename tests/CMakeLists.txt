@@ -47,6 +47,7 @@ add_test(
           "-DGPF_GENERATOR=${CMAKE_GENERATOR}"
           "-DGPF_CXX_COMPILER=${CMAKE_CXX_COMPILER}"
           "-DGPF_CXX_COMPILER_ID=${CMAKE_CXX_COMPILER_ID}"
+          "-DGPF_CONFIG=$<CONFIG>"
           -P "${CMAKE_SOURCE_DIR}/cmake/ValidatePackage.cmake")
 # The end-to-end suite drives the built executables as real, independent OS processes.
 gpf_add_test(test_multiprocess

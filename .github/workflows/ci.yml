@@ -90,7 +90,7 @@ jobs:
       fail-fast: false
       matrix:
         compiler: [gcc, clang]
-        sanitizer: [address+undefined]
+        sanitizer: ["address,undefined"]
     steps:
       - uses: actions/checkout@v4
       - name: Configure
@@ -98,8 +98,7 @@ jobs:
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
           -DCMAKE_C_COMPILER=${{ matrix.compiler == 'gcc' && 'gcc' || 'clang' }}
           -DCMAKE_CXX_COMPILER=${{ matrix.compiler == 'gcc' && 'g++' || 'clang++' }}
-          -DCMAKE_CXX_FLAGS="-fsanitize=${{ matrix.sanitizer }} -fno-omit-frame-pointer -g"
-          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=${{ matrix.sanitizer }}"
+          -DGPF_SANITIZERS=${{ matrix.sanitizer }}
           -DGPF_BUILD_TESTS=ON -DGPF_BUILD_APPS=ON -DGPF_BUILD_EXAMPLES=ON
       - name: Build
         run: cmake --build build --parallel

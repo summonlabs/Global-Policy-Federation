@@ -79,6 +79,11 @@ Result<ProcessHandle> spawn_process(const std::string& program,
 // Blocks until the process exits and returns its exit code.
 Result<int> wait_process(ProcessHandle& process);
 
+// Non-blocking process state query, for callers that must not block: a readiness wait ends when the
+// child either becomes ready or exits. An exited process is reaped here and its exit code is
+// remembered, so a later wait_process returns the same value.
+Result<bool> process_has_exited(ProcessHandle& process);
+
 // Requests termination of a running process.
 Status terminate_process(ProcessHandle& process);
 

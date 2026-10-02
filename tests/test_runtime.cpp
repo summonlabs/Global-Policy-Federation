@@ -317,44 +317,77 @@ GPF_TEST(runtime, callbacks_run_without_the_state_lock_and_failures_are_containe
   CHECK(compiled.ok());
 }
 
-GPF_TEST(runtime, shutdown_is_safe_with_compilation_in_flight) {
-  TempDirectory directory("runtime-shutdown");
+GPF_TEST(runtime, destruction_never_delivers_events) {
+  // A listener commonly captures objects created after the runtime, so a callback delivered while
+  // the runtime is being destroyed would run against state that no longer exists. An explicit
+  // shutdown reports the shutdown event exactly once; destruction reports nothing at all.
+  TempDirectory directory("runtime-destructor");
   auto plan = generate_scenario(4242, 1, 1);
   REQUIRE(plan.ok());
-  auto site = SiteRuntime::open(site_config(*plan, plan->sites[0], directory, "e"));
-  REQUIRE(site.ok());
-
-  std::atomic<bool> stop{false};
-  std::atomic<int> successes{0};
-  std::atomic<int> cancellations{0};
-  std::vector<std::thread> workers;
-  for (int i = 0; i < 4; ++i) {
-    workers.emplace_back([&] {
-      while (!stop.load()) {
-        auto compiled = (*site)->compile_effective_policy(Timestamp{platform::system_now_millis()});
-        if (compiled.ok()) {
-          ++successes;
-        } else {
-          ++cancellations;
-        }
-      }
+  auto shutdown_events = std::make_shared<std::atomic<int>>(0);
+  {
+    auto site = SiteRuntime::open(site_config(*plan, plan->sites[0], directory, "g"));
+    REQUIRE(site.ok());
+    (*site)->set_listener([shutdown_events](const SiteEvent& event) {
+      if (event.kind == SiteEventKind::Shutdown) ++(*shutdown_events);
     });
+    CHECK((*site)->shutdown().ok());
+    CHECK((*site)->shutdown().ok());  // idempotent: stopping twice reports nothing twice
+    CHECK_EQ(shutdown_events->load(), 1);
   }
-  // Let the workers issue real compilations, then shut down underneath them.
-  for (int i = 0; i < 50; ++i) {
-    (void)(*site)->compile_effective_policy(Timestamp{platform::system_now_millis()});
-  }
-  stop = true;
-  const Status shutdown_status = (*site)->shutdown();
-  CHECK(shutdown_status.ok());
-  for (std::thread& worker : workers) worker.join();
-  CHECK(successes.load() + cancellations.load() > 0);
+  // The runtime was destroyed above; no further event may have been delivered.
+  CHECK_EQ(shutdown_events->load(), 1);
+}
 
-  // After shutdown, compilation is refused instead of quietly succeeding.
-  auto after = (*site)->compile_effective_policy(Timestamp{platform::system_now_millis()});
-  CHECK(!after.ok());
-  CHECK(after.error.code == ErrorCode::Cancelled || after.error.code == ErrorCode::Fenced ||
-        after.error.code == ErrorCode::InvalidState);
+GPF_TEST(runtime, shutdown_is_safe_with_compilation_in_flight) {
+  // Shutdown abandons whatever is still queued, so every caller blocked on a queued compilation
+  // must be released. That window is narrow: all workers must still be asleep with work queued.
+  // The cycle is therefore repeated, which is what makes this a regression test for the abandoned
+  // waiter rather than a single lucky interleaving.
+  int successes = 0;
+  int cancellations = 0;
+  for (int round = 0; round < 8; ++round) {
+    TempDirectory directory("runtime-shutdown");
+    auto plan = generate_scenario(4242, 1, 1);
+    REQUIRE(plan.ok());
+    auto site = SiteRuntime::open(site_config(*plan, plan->sites[0], directory, "e"));
+    REQUIRE(site.ok());
+
+    std::atomic<bool> stop{false};
+    std::atomic<int> round_successes{0};
+    std::atomic<int> round_cancellations{0};
+    std::vector<std::thread> workers;
+    for (int i = 0; i < 4; ++i) {
+      workers.emplace_back([&] {
+        while (!stop.load()) {
+          auto compiled = (*site)->compile_effective_policy(Timestamp{platform::system_now_millis()});
+          if (compiled.ok()) {
+            ++round_successes;
+          } else {
+            ++round_cancellations;
+          }
+        }
+      });
+    }
+    // Let the workers issue real compilations, then shut down underneath them.
+    for (int i = 0; i < 50; ++i) {
+      (void)(*site)->compile_effective_policy(Timestamp{platform::system_now_millis()});
+    }
+    stop = true;
+    const Status shutdown_status = (*site)->shutdown();
+    CHECK(shutdown_status.ok());
+    // Joining only returns if every blocked caller was released by the shutdown.
+    for (std::thread& worker : workers) worker.join();
+    successes += round_successes.load();
+    cancellations += round_cancellations.load();
+
+    // After shutdown, compilation is refused instead of quietly succeeding.
+    auto after = (*site)->compile_effective_policy(Timestamp{platform::system_now_millis()});
+    CHECK(!after.ok());
+    CHECK(after.error.code == ErrorCode::Cancelled || after.error.code == ErrorCode::Fenced ||
+          after.error.code == ErrorCode::InvalidState);
+  }
+  CHECK(successes + cancellations > 0);
 }
 
 GPF_TEST(runtime, returned_policy_is_never_older_than_the_state_it_reports) {

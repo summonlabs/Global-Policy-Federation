@@ -148,6 +148,9 @@ class SiteRuntime {
   void disconnect(const std::string& reason);
   bool is_connected() const;
 
+  // Stops the runtime and reports the shutdown event exactly once. Destruction stops the runtime
+  // without reporting anything, because a listener may already have outlived the objects it
+  // captured.
   Status shutdown();
 
   SiteStatus status() const;
@@ -179,6 +182,7 @@ class SiteRuntime {
                                       std::string* reason) const;
   void start_workers();
   void stop_workers();
+  Status shutdown_internal(bool report_event);
 
   mutable std::mutex mutex_;
   std::condition_variable work_available_;
@@ -199,6 +203,7 @@ class SiteRuntime {
   SiteStatus status_{};
   bool stopping_{false};
   bool workers_started_{false};
+  bool stopped_{false};
 };
 
 // ---------------------------------------------------------------------------------------
@@ -280,7 +285,8 @@ class FederationRuntime {
   MembershipBinding membership_{};
   CapabilityCatalog catalog_{};
   FederationStatus status_{};
-  bool stopping_{false};
+  // Read by the serve and session paths without the state lock, so it is atomic by construction.
+  std::atomic<bool> stopping_{false};
 };
 
 }  // namespace gpf

@@ -350,6 +350,19 @@ gpf-site run --plan plan.json --site-index 0 --store ./site-store \
              --out site-summary.json
 ```
 
+A coordinator announces readiness on standard output as soon as its listener is established, and
+before it serves anything:
+
+```json
+{"event":"listening","port":46000,"bind":"127.0.0.1","published_bundles":4,"rejected_publications":0}
+```
+
+That document is the supervisor-facing contract: it names the port the coordinator actually bound
+(so `--port 0` may be used to let the operating system choose one), it is printed only after the
+listener is ready to accept, and it is followed by the final summary document when the session
+budget is exhausted. A supervisor therefore never guesses a port and never races a starting
+process, and neither does the multiprocess test suite.
+
 Exit codes are meaningful: `gpf-site` exits 0 when it synchronized, 2 when the federation was
 unreachable (it kept working on accepted policy), 1 on failure; `gpfctl verify-store` exits 3 when
 a store opened read-only because of interior corruption.
@@ -409,15 +422,17 @@ the checks reported by the run, not estimates.
 | test_authority | 8 | 103 | delegation narrowing, chain outcomes, revocation ordering, epoch fencing, restore |
 | test_effective | 14 | 1274 | precedence, conflict containment, overrides, capability outcomes, partition, seeded property test |
 | test_protocol | 5 | 44 | framing, malformed and oversized frames, body validation, socket disconnect |
-| test_runtime | 9 | 155 | publication authority, sync/activate/report, receipt dedup, callbacks, shutdown, fencing |
+| test_runtime | 10 | 196 | publication authority, sync/activate/report, receipt dedup, callbacks, shutdown under load, destructor contract, fencing |
 | test_store | 14 | 171 | round trip, torn tail, interior corruption, compaction, tampering, real process crash |
 | test_multiprocess | 2 | 138 | three real executables over real TCP: sync, partition, restart, reconnect |
 | package_validation | CTest | - | install into a throwaway prefix, build and run an independent consumer |
 
-- **GCC 14.2 / Ninja, Debug:** 8 suites, 76 tests, 2230 checks, 0 failures; `ctest` 9/9 passed
-  including package validation.
-- **MSVC 19.4x / Visual Studio 2022, Release, x64:** `ctest` 9/9 passed, including the
-  multiprocess end-to-end test and package validation.
+- **GCC 14.2 / Ninja, Debug and Release:** 8 suites, 77 tests, 0 failures; `ctest` 9/9 passed in
+  each configuration, including package validation.
+- **Clang 19.1 / Ninja, Debug:** `ctest` 9/9 passed, including the multiprocess end-to-end test.
+- **MSVC 19.4x / Visual Studio 2022, x64:** `ctest` 9/9 passed in Debug and in Release, including
+  the multiprocess end-to-end test and package validation. The Debug run also exercises the
+  shutdown-under-load path that the slower runtime makes far more likely to interleave.
 - **Real process crash:** `test_store` spawns an independent process which writes three records,
   appends a partial record and exits without unwinding; the parent reopens the store, classifies the
   torn tail, truncates it, and continues. The helper's exit code is asserted.
@@ -432,9 +447,20 @@ the checks reported by the run, not estimates.
   unsafe file names, path traversal in a manifest, replayed and reordered revocations, and
   replayed receipts.
 
-Not executed here, and therefore not claimed: Linux builds and tests, and the AddressSanitizer /
-UndefinedBehaviorSanitizer configurations. Both are configured in `ci.yml` for standard hosted
-runners; nothing in this document asserts a result for them.
+- **Determinism of the process tests:** the multiprocess suite never guesses a port. Each
+  coordinator asks the operating system for a free port, announces the port it bound together with
+  its readiness, and only then does a site connect; the announced port is read back from the
+  coordinator's own output, and a coordinator that exits before listening fails the run instead of
+  leaving it waiting. The suite was run repeatedly, including concurrently, to confirm it does not
+  depend on start-up timing.
+- **Linux, in continuous integration:** the same suites run on Ubuntu 24.04 with GCC, with Clang,
+  and under AddressSanitizer plus UndefinedBehaviorSanitizer with both compilers, plus a job that
+  installs the project and builds an independent consumer against the installed package. Results
+  are reported by the workflow run, not by this document.
+
+Not executed on the machine described above, and therefore not claimed here: Linux builds and tests
+(the CI jobs above are the evidence for Linux), and the AddressSanitizer / UndefinedBehaviorSanitizer
+configurations.
 
 ## Benchmarks
 
@@ -479,8 +505,16 @@ Reading these honestly:
   Windows offers no portable directory flush, so sync_directory is a documented no-op after
   an atomic replace; files themselves are flushed with FlushFileBuffers (_commit) before publishing.
 - **Linux**: supported by the portable code paths (POSIX sockets, fsync, fsync of the directory
-  after a rename) and built in CI with GCC and Clang; it was **not** run on this machine, so no
-  Linux result is claimed here.
+  after a rename) and exercised by the CI jobs described above. A filesystem that cannot express
+  directory durability (a directory fsync answering EINVAL or ENOTSUP, as some container and
+  memory-backed filesystems do) is treated as a capability limit rather than an I/O failure: the
+  file itself is always flushed and the rename is always atomic, and that limitation is reported
+  here rather than hidden. Any other fsync error is a real failure and is returned as one.
+- **Signals on POSIX**: writing to a socket whose peer has gone must return an error, never kill
+  the process. Sockets are configured with SO_NOSIGPIPE and every send uses MSG_NOSIGNAL where the
+  platform provides them; a platform offering neither requires the embedding process to ignore
+  SIGPIPE, which is documented in `gpf/net.hpp` because this library never changes process-wide
+  signal disposition on a caller's behalf.
 - **No timeouts anywhere**: there is no receive timeout, no CTest TIMEOUT, no shell timeout wrapper
   and no watchdog. Shutdown and partition detection work by closing sockets. A hanging test is
   treated as a defect.

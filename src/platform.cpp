@@ -10,8 +10,12 @@
 #include <windows.h>
 #include <io.h>
 #else
+#include <cerrno>
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #endif
 
@@ -182,10 +186,20 @@ Status sync_directory(const std::filesystem::path& directory) {
     return Status::failure(ErrorCode::IoError, "cannot open directory for synchronization",
                            directory.string());
   }
+  errno = 0;
   const int result = ::fsync(descriptor);
+  const int fsync_error = errno;
   ::close(descriptor);
   if (result != 0) {
-    return Status::failure(ErrorCode::IoError, "cannot synchronize directory", directory.string());
+    // Some filesystems cannot express directory durability and answer EINVAL/ENOTSUP. That is a
+    // capability limit of the filesystem, not an I/O failure, so it is treated as a documented
+    // no-op: the file itself was already flushed and the rename was atomic. Any other error is a
+    // real failure and is reported as one.
+    if (fsync_error == EINVAL || fsync_error == ENOTSUP || fsync_error == EOPNOTSUPP) {
+      return Status::success();
+    }
+    return Status::failure(ErrorCode::IoError, "cannot synchronize directory",
+                           directory.string() + " (errno " + std::to_string(fsync_error) + ")");
   }
   return Status::success();
 #endif
@@ -303,10 +317,25 @@ Result<int> run_process(const std::string& program, const std::vector<std::strin
   std::string line = "'" + program + "'";
   for (const std::string& argument : arguments) line += " '" + argument + "'";
 #endif
-  const int code = std::system(line.c_str());
-  if (code == -1) {
+  const int status = std::system(line.c_str());
+  if (status == -1) {
     return Result<int>::failure(ErrorCode::Unavailable, "cannot start process", program);
   }
+#if defined(_WIN32)
+  // cmd.exe already reports the process exit code.
+  const int code = status;
+#else
+  // The C library reports a wait status on POSIX: an exit code of 2 arrives as 512, and a signal
+  // death arrives as the signal number. Decode it so callers see the exit code on every platform.
+  int code = 0;
+  if (WIFEXITED(status)) {
+    code = WEXITSTATUS(status);
+  } else if (WIFSIGNALED(status)) {
+    code = 128 + WTERMSIG(status);
+  } else {
+    code = status;
+  }
+#endif
   return Result<int>::success(code);
 }
 
@@ -440,6 +469,40 @@ Result<int> wait_process(ProcessHandle& process) {
 #endif
 }
 
+Result<bool> process_has_exited(ProcessHandle& process) {
+  if (!process.valid()) {
+    return Result<bool>::failure(ErrorCode::InvalidArgument, "process handle is not valid");
+  }
+  if (process.waited) return Result<bool>::success(true);
+#if defined(_WIN32)
+  const DWORD result = WaitForSingleObject(reinterpret_cast<HANDLE>(process.handle), 0);
+  if (result == WAIT_TIMEOUT) return Result<bool>::success(false);
+  if (result != WAIT_OBJECT_0) {
+    return Result<bool>::failure(ErrorCode::IoError, "querying the process state failed");
+  }
+  DWORD code = 0;
+  if (!GetExitCodeProcess(reinterpret_cast<HANDLE>(process.handle), &code)) {
+    return Result<bool>::failure(ErrorCode::IoError, "cannot read the process exit code");
+  }
+  CloseHandle(reinterpret_cast<HANDLE>(process.handle));
+  process.handle = -1;
+  process.waited = true;
+  process.exit_code = static_cast<int>(code);
+  return Result<bool>::success(true);
+#else
+  int status = 0;
+  const pid_t pid = ::waitpid(static_cast<pid_t>(process.handle), &status, WNOHANG);
+  if (pid == 0) return Result<bool>::success(false);
+  if (pid < 0) {
+    return Result<bool>::failure(ErrorCode::IoError, "querying the process state failed");
+  }
+  process.handle = -1;
+  process.waited = true;
+  process.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+  return Result<bool>::success(true);
+#endif
+}
+
 Status terminate_process(ProcessHandle& process) {
   if (!process.valid()) return Status::success();
 #if defined(_WIN32)
@@ -451,9 +514,15 @@ Status terminate_process(ProcessHandle& process) {
   }
   return Status::success();
 #else
-  const int result = ::kill(static_cast<pid_t>(process.handle), SIGTERM);
+  const pid_t pid = static_cast<pid_t>(process.handle);
   process.handle = -1;
-  if (result != 0) return Status::failure(ErrorCode::IoError, "cannot terminate the process");
+  if (::kill(pid, SIGTERM) != 0) {
+    return Status::failure(ErrorCode::IoError, "cannot terminate the process");
+  }
+  // The child is our own and terminates on SIGTERM, so waiting for it reaps the process instead of
+  // leaving a zombie behind. Termination is requested, never raced against a clock.
+  int status = 0;
+  (void)::waitpid(pid, &status, 0);
   return Status::success();
 #endif
 }

@@ -40,7 +40,11 @@ const char* site_event_kind_name(SiteEventKind kind) noexcept {
 SiteRuntime::SiteRuntime() = default;
 
 SiteRuntime::~SiteRuntime() {
-  auto status = shutdown();
+  // Destruction never delivers a callback. A listener commonly captures objects that were created
+  // after this runtime and are therefore already destroyed when it is destroyed, which made an
+  // event delivered from here a use-after-scope waiting to happen. An explicit shutdown() still
+  // reports the shutdown event; the destructor only releases resources.
+  auto status = shutdown_internal(false);
   (void)status;
 }
 
@@ -112,7 +116,11 @@ void SiteRuntime::stop_workers() {
     status_.stopping = true;
     queue_.clear();
   }
+  // Both populations must be woken: the workers so they can return, and any caller blocked on a
+  // queued compilation, whose task was just abandoned by clearing the queue. Without the second
+  // notification a caller waits for a completion that no worker will ever publish.
   work_available_.notify_all();
+  work_finished_.notify_all();
   // Workers are joined without holding the state lock: they only need the queue lock to finish.
   for (std::thread& worker : workers_) {
     if (worker.joinable()) worker.join();
@@ -121,7 +129,14 @@ void SiteRuntime::stop_workers() {
   workers_started_ = false;
 }
 
-Status SiteRuntime::shutdown() {
+Status SiteRuntime::shutdown() { return shutdown_internal(true); }
+
+Status SiteRuntime::shutdown_internal(bool report_event) {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (stopped_) return Status::success();
+    stopped_ = true;
+  }
   stop_workers();
   if (socket_ != nullptr) {
     socket_->close();
@@ -131,8 +146,10 @@ Status SiteRuntime::shutdown() {
     const Status status = store_->close();
     if (!status.ok()) return status;
   }
-  emit(SiteEvent{SiteEventKind::Shutdown, "shutdown", "site runtime stopped", PolicyBundleId{},
-                 OverrideId{}, Generation{}, status_.receipts});
+  if (report_event) {
+    emit(SiteEvent{SiteEventKind::Shutdown, "shutdown", "site runtime stopped", PolicyBundleId{},
+                   OverrideId{}, Generation{}, status_.receipts});
+  }
   return Status::success();
 }
 
@@ -1352,8 +1369,11 @@ Status FederationRuntime::serve_once(Timestamp now) {
 }
 
 void FederationRuntime::stop() {
-  stopping_ = true;
-  status_.stopping = true;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    stopping_ = true;
+    status_.stopping = true;
+  }
   // Closing the listener is what unblocks a pending accept; no clock or watchdog is involved.
   if (listener_ != nullptr) listener_->close();
 }

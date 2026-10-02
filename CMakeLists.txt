@@ -63,6 +63,23 @@ else()
   endif()
 endif()
 
+# Sanitizer builds are exported as an interface requirement, not applied behind the consumer's
+# back. A static library compiled with AddressSanitizer or UndefinedBehaviorSanitizer cannot be
+# linked by a program that does not also link the sanitizer runtime, so the flags travel with the
+# target: an installed package built this way stays usable, and the package validation exercises
+# exactly that configuration. Left empty, no sanitizer flags are added anywhere.
+set(GPF_SANITIZERS "" CACHE STRING
+    "Sanitizer list compiled into the library and exported to consumers, for example address,undefined")
+if(GPF_SANITIZERS)
+  if(MSVC)
+    message(STATUS "GPF_SANITIZERS is not supported with MSVC in this project; ignoring it")
+  else()
+    target_compile_options(gpf PUBLIC "-fsanitize=${GPF_SANITIZERS}" -fno-omit-frame-pointer)
+    target_link_options(gpf PUBLIC "-fsanitize=${GPF_SANITIZERS}")
+    message(STATUS "Sanitizers enabled and exported to consumers: ${GPF_SANITIZERS}")
+  endif()
+endif()
+
 find_package(Threads REQUIRED)
 target_link_libraries(gpf PRIVATE Threads::Threads)
 
