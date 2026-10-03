@@ -1,9 +1,5 @@
 # Continuous integration for Global Policy Federation.
 #
-# Standard hosted runners only. Tests are run plainly: no CTest TIMEOUT property, no shell timeout
-# wrapper, no watchdogs, no timeout-minutes. A hanging test is a defect to diagnose, not a
-# condition to mask.
-#
 # Sanitizers: Linux exercises AddressSanitizer and UndefinedBehaviorSanitizer with GCC and Clang.
 # MSVC's address sanitizer is exercised only where the toolset genuinely supports it, so Windows
 # sanitizer coverage is documented as a limitation rather than claimed.
